@@ -3651,6 +3651,17 @@
             }
           ]
         },
+        "latestUsage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The most recent model request in this turn, not the turn's cumulative usage."
+        },
         "lastTurn": {
           "anyOf": [
             {

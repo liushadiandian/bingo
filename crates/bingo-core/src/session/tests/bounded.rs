@@ -70,6 +70,34 @@ async fn bounded_attachment_keeps_the_atomic_cut_and_an_explicit_older_cursor() 
 }
 
 #[tokio::test]
+async fn bounded_snapshot_keeps_latest_request_after_completion_and_resume() {
+    let provider = ScriptedProvider::new(vec![Script::Events(text("done"))]);
+    let mailbox = start(provider, vec![]);
+    let (mut full, mut events) = mailbox.attach().await.unwrap();
+    mailbox.submit(IntentId::mint(), Input::text("hi", Origin::surface("test")));
+    drive(&mut events, &mut full, turn_completed).await;
+    assert!(full.latest_usage.is_some());
+    let (bounded, _, _) = mailbox.attach_bounded(Some(512 * 1024)).await.unwrap();
+    assert_eq!(bounded.latest_usage, full.latest_usage);
+
+    let mut journal = Vec::new();
+    let mut replay = mailbox.events_since(Seq::ZERO).await.unwrap();
+    while let Some(Some(frame)) = replay.next().now_or_never() {
+        journal.push(frame);
+    }
+    let resumed = resume(journal, None, Services::none(), move |_| {
+        Arc::new(config(
+            ScriptedProvider::new(vec![]),
+            vec![],
+            Arc::new(NoHost),
+        ))
+    })
+    .unwrap();
+    let (restored, _, _) = resumed.attach_bounded(Some(512 * 1024)).await.unwrap();
+    assert_eq!(restored.latest_usage, full.latest_usage);
+}
+
+#[tokio::test]
 async fn a_retry_dropped_cursor_is_stale_without_changing_generation() {
     let first = start(ScriptedProvider::new(vec![]), vec![]);
     first

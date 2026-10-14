@@ -34,6 +34,9 @@ pub struct SessionState {
     pub interactions: Vec<Interaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextUsage>,
+    /// The most recent model request in this turn, not the turn's cumulative usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_usage: Option<Usage>,
     /// The turn that last ended, whole: what a surface says after a turn is
     /// drawn from this rather than kept by the surface (M84).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +129,7 @@ impl SessionState {
             queue: Vec::new(),
             interactions: Vec::new(),
             context: None,
+            latest_usage: None,
             last_turn: None,
             unread: false,
             closed: false,
@@ -291,6 +295,7 @@ impl SessionState {
         origin: TurnOrigin,
         started_at: Timestamp,
     ) -> Applied {
+        self.latest_usage = None;
         self.turn = Some(LiveTurn {
             id: turn.clone(),
             started_at,
@@ -316,6 +321,7 @@ impl SessionState {
             t.round += 1;
             t.retrying = None;
         }
+        self.latest_usage = Some(usage);
         self.summary.usage.add(usage);
         self.context = Some(context);
         Applied::Turn
@@ -470,6 +476,101 @@ mod tests {
             },
             ..assistant(id, "", ItemStatus::Completed)
         }
+    }
+
+    #[test]
+    fn latest_request_survives_completion_and_replay_but_not_a_new_turn() {
+        let first = Usage {
+            input_tokens: 90,
+            cache_read_tokens: 10,
+            ..Usage::default()
+        };
+        let latest = Usage {
+            input_tokens: 20,
+            cache_read_tokens: 80,
+            ..Usage::default()
+        };
+        let turn = TurnId::from_raw("trn_1");
+        let start = Event::TurnStarted {
+            turn: turn.clone(),
+            inputs: vec![],
+            origin: TurnOrigin::Submit,
+        };
+        let context = ContextUsage {
+            used: 100,
+            window: 200,
+            trigger: 180,
+        };
+        let events = [
+            frame(1, start),
+            frame(
+                2,
+                Event::TurnUsage {
+                    turn: turn.clone(),
+                    usage: first,
+                    context,
+                },
+            ),
+            frame(
+                3,
+                Event::TurnUsage {
+                    turn: turn.clone(),
+                    usage: latest,
+                    context,
+                },
+            ),
+        ];
+        let mut st = SessionState::new(summary());
+        for event in &events {
+            st.apply(event);
+        }
+        let mut replay = SessionState::new(summary());
+        for event in &events {
+            replay.apply(event);
+        }
+        assert_eq!(st, replay);
+        let mut total = first;
+        total.add(latest);
+        assert_eq!(st.turn.as_ref().unwrap().usage, total);
+        assert_eq!(st.latest_usage, Some(latest));
+        st.apply(&frame(
+            4,
+            Event::TurnCompleted {
+                turn: turn.clone(),
+                status: TurnStatus::Completed,
+                usage: total,
+            },
+        ));
+        assert_eq!(st.latest_usage, Some(latest));
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["latestUsage"]["cacheReadTokens"], 80);
+        assert_eq!(
+            serde_json::from_value::<SessionState>(json.clone()).unwrap(),
+            st
+        );
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("latestUsage");
+        assert_eq!(
+            serde_json::from_value::<SessionState>(legacy)
+                .unwrap()
+                .latest_usage,
+            None
+        );
+        st.apply(&frame(
+            5,
+            Event::TurnStarted {
+                turn: TurnId::from_raw("trn_2"),
+                inputs: vec![],
+                origin: TurnOrigin::Submit,
+            },
+        ));
+        assert_eq!(st.latest_usage, None);
+        assert!(
+            serde_json::to_value(&st)
+                .unwrap()
+                .get("latestUsage")
+                .is_none()
+        );
     }
 
     /// One item, three frames on its way to done: the count moves once.

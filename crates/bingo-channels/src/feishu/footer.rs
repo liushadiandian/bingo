@@ -101,10 +101,28 @@ fn line(state: &SessionState) -> String {
             count(usage.cache_read_tokens)
         ));
     }
+    if let Some(recent) = state.latest_usage
+        && let Some(hit) = cache_hit(recent)
+    {
+        parts.push(format!("last request cache hit {hit}"));
+    }
     if let Some(context) = state.context.filter(|context| context.window > 0) {
         parts.push(format!("ctx {}%", context.percent()));
     }
     parts.join(" · ")
+}
+
+fn cache_hit(usage: Usage) -> Option<String> {
+    let input = usage.input_total();
+    if input == 0 {
+        return None;
+    }
+    let percent = usage.cache_read_tokens as f64 * 100.0 / input as f64;
+    Some(if percent.fract() == 0.0 {
+        format!("{percent:.0}%")
+    } else {
+        format!("{percent:.1}%")
+    })
 }
 
 fn count(value: u64) -> String {
@@ -180,6 +198,70 @@ mod tests {
         assert_eq!(
             append("已经完成。", &state, &limits(20_000)),
             "已经完成。\n\n---\ngpt-6-sol · effort:xhigh · out 328 · in 193.4k cw 0 cr 193k · ctx 75%"
+        );
+    }
+
+    #[test]
+    fn cache_hit_is_from_the_last_request_not_the_turn_total() {
+        let mut state = fixtures::state();
+        state.apply(&fixtures::turn_started(1));
+        let first = Usage {
+            input_tokens: 900,
+            cache_read_tokens: 100,
+            ..Usage::default()
+        };
+        let last = Usage {
+            input_tokens: 20,
+            cache_read_tokens: 80,
+            ..Usage::default()
+        };
+        let context = ContextUsage {
+            used: 100,
+            window: 200,
+            trigger: 180,
+        };
+        for (seq, usage) in [(2, first), (3, last)] {
+            state.apply(&fixtures::frame(
+                seq,
+                Event::TurnUsage {
+                    turn: TurnId::from_raw(fixtures::TURN),
+                    usage,
+                    context,
+                },
+            ));
+        }
+        let mut total = first;
+        total.add(last);
+        state.apply(&fixtures::frame(
+            4,
+            Event::TurnCompleted {
+                turn: TurnId::from_raw(fixtures::TURN),
+                status: TurnStatus::Completed,
+                usage: total,
+            },
+        ));
+        assert_eq!(
+            append("Done.", &state, &limits(20_000)),
+            "Done.\n\n---\nfake-1 · out 0 · in 1.1k cw 0 cr 180 · last request cache hit 80% · ctx 50%"
+        );
+    }
+
+    #[test]
+    fn cache_hit_requires_a_request_with_input_tokens() {
+        let mut state = fixtures::state();
+        state.latest_usage = Some(Usage::default());
+        assert_eq!(
+            append("Done.", &state, &limits(20_000)),
+            "Done.\n\n---\nfake-1"
+        );
+        state.latest_usage = Some(Usage {
+            input_tokens: 2,
+            cache_read_tokens: 1,
+            ..Usage::default()
+        });
+        assert_eq!(
+            append("Done.", &state, &limits(20_000)),
+            "Done.\n\n---\nfake-1 · last request cache hit 33.3%"
         );
     }
 

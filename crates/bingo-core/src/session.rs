@@ -615,6 +615,7 @@ impl Actor {
         snapshot.queue = self.state.queue.clone();
         snapshot.interactions = self.state.interactions.clone();
         snapshot.context = self.state.context;
+        snapshot.latest_usage = self.state.latest_usage;
         snapshot.last_turn = self.state.last_turn.clone();
         snapshot.unread = self.state.unread;
         snapshot.closed = self.state.closed;
