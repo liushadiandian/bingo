@@ -457,6 +457,7 @@ impl Runner {
         match self.adapter.command(&text) {
             Some(ChannelCommand::NewSession) => return self.new_session().await,
             Some(ChannelCommand::Stop) => return self.stop().await,
+            Some(ChannelCommand::Help) => return self.help().await,
             None => {}
         }
         match self.answering(&text) {
@@ -479,6 +480,19 @@ impl Runner {
                 self.deliverer.expecting(intent);
                 self.acknowledge().await;
             }
+        }
+    }
+
+    async fn help(&mut self) {
+        let text = "/new - Start a new session; keep the old history\n\
+/stop - Stop the current turn\n\
+/compact [instructions] - Compact the context\n\
+/status - Show session status\n\
+/model [provider/model] - Show or change the model\n\
+/think [level] - Show or change the thinking level\n\
+/help - Show these commands";
+        if let Err(error) = self.post(text).await {
+            tracing::warn!(%error, key = %self.key, "the command help could not be sent");
         }
     }
 

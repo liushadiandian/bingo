@@ -23,6 +23,7 @@ pub mod frame;
 pub mod merged;
 pub mod posted;
 pub mod send;
+mod slash;
 pub mod token;
 pub mod upload;
 pub mod ws;
@@ -99,6 +100,8 @@ pub struct Config {
     pub attachments: PathBuf,
     /// Commands this adapter maps to controls owned by another surface.
     pub command_mappings: BTreeMap<String, String>,
+    /// Whether startup may add missing entries to the app's command menu.
+    pub sync_slash_commands: bool,
 }
 
 pub struct Feishu {
@@ -119,6 +122,7 @@ pub struct Feishu {
     /// again from an edit that carries only the handle.
     chats: Mutex<HashMap<String, String>>,
     command_mappings: BTreeMap<String, String>,
+    sync_slash_commands: bool,
 }
 
 impl std::fmt::Debug for Feishu {
@@ -150,6 +154,20 @@ impl Feishu {
             streaming_since: Mutex::new(HashMap::new()),
             chats: Mutex::new(HashMap::new()),
             command_mappings,
+            sync_slash_commands: config.sync_slash_commands,
+        }
+    }
+
+    async fn register_commands(&self) {
+        if !self.sync_slash_commands {
+            return;
+        }
+        match tokio::time::timeout(Duration::from_secs(10), slash::sync(&self.api)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the Feishu slash-command menu could not be synchronized");
+            }
+            Err(_) => tracing::warn!("Feishu slash-command registration timed out"),
         }
     }
 
@@ -433,6 +451,7 @@ impl ChannelAdapter for Feishu {
         {
             "clear" => Some(ChannelCommand::NewSession),
             "esc" | "escape" | "stop" => Some(ChannelCommand::Stop),
+            "help" => Some(ChannelCommand::Help),
             _ => None,
         }
     }
@@ -453,6 +472,10 @@ impl ChannelAdapter for Feishu {
         }
         let me = self.whoami().await?;
         *locked(&self.me) = me.clone();
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = self.register_commands() => {}
+        }
         ws::listen(
             &self.api,
             &self.app_secret,
@@ -508,6 +531,7 @@ fn with_default_command_mappings(configured: BTreeMap<String, String>) -> BTreeM
     let mut mappings = BTreeMap::from([
         ("/new".to_string(), "/clear".to_string()),
         ("/stop".to_string(), "esc".to_string()),
+        ("/help".to_string(), "/help".to_string()),
     ]);
     for (source, target) in configured {
         if let Some(source) = configured_command_name(&source) {

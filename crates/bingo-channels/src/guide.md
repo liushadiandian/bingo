@@ -29,7 +29,12 @@ intervalMs = 700
   not on the default host.
 - `commandMappings` (`channels.feishu.commandMappings`) — a map from a Feishu
   command to a terminal control. It defaults to `/new` → `/clear` and `/stop`
-  → `esc`; add another source command by mapping it to `/clear` or `esc`.
+  → `esc`, plus `/help` → `/help`; add another source command by mapping it
+  to `/clear`, `esc` or `/help`.
+- `syncSlashCommands` (`channels.feishu.syncSlashCommands`, default `false`) —
+  add missing common commands to the app's native `/` picker at startup.
+  This is opt-in because the catalogue belongs to the whole Feishu app.
+  Existing entries and their descriptions are never overwritten or deleted.
 - `coalesce` — how often a streaming answer is redrawn: `minChars`
   (48) new characters worth a redraw, `intervalMs` (700) the longest anyone
   waits to see something new.
@@ -40,6 +45,25 @@ intervalMs = 700
   `maxText` and `maxActions` are the platform's limits.
 
 `bingo --channels <adapter>[=<value>]` says the same thing for one run.
+
+## Feishu's native command picker
+
+Enable `syncSlashCommands = true` under `[channels.feishu]` after granting and
+publishing the app's `application:app_slash_command:read` and
+`application:app_slash_command:write` scopes. Registration adds `new`, `stop`,
+`compact`, `status`, `model`, `think` and `help`, with English descriptions.
+Type `/` in the Feishu client to discover them. This does not grant app scopes
+or publish an app version; those remain the app owner's actions.
+
+Registration failure is logged and does not stop the chat connection. A partial
+or malformed catalogue is left alone rather than risking duplicate entries.
+Startup spends at most ten seconds on registration. Restarting reconciles
+missing entries without replacing commands the app already owns.
+
+`/new` and `/stop` keep the existing control behaviour; `/help` lists the common
+commands without asking a model. Other commands, including optional arguments
+to `/compact`, `/model` and `/think`, still reach the session's command parser.
+The picker is only discovery: typed commands work without enabling sync.
 
 ## Who may speak
 

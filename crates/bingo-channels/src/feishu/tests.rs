@@ -36,6 +36,7 @@ async fn feishu(server: &MockServer) -> Feishu {
         base: server.uri(),
         attachments: std::path::PathBuf::from("/nonexistent-bingo-feishu-attachments"),
         command_mappings: BTreeMap::new(),
+        sync_slash_commands: false,
     })
 }
 
@@ -142,6 +143,7 @@ async fn a_channel_with_no_credential_refuses_before_it_dials() {
         base: "http://127.0.0.1:1".into(),
         attachments: std::path::PathBuf::from("/nonexistent-bingo-feishu-attachments"),
         command_mappings: BTreeMap::new(),
+        sync_slash_commands: false,
     });
     let (post, _arrivals) = tokio::sync::mpsc::channel(1);
     let error = bare
@@ -166,9 +168,26 @@ fn terminal_controls_have_feishu_command_defaults() {
         base: "http://127.0.0.1:1".into(),
         attachments: std::path::PathBuf::from("/nonexistent-bingo-feishu-attachments"),
         command_mappings: BTreeMap::new(),
+        sync_slash_commands: false,
     });
     assert_eq!(feishu.command("/new"), Some(ChannelCommand::NewSession));
     assert_eq!(feishu.command("/stop"), Some(ChannelCommand::Stop));
+    assert_eq!(feishu.command("/help"), Some(ChannelCommand::Help));
+    assert_eq!(feishu.command(" /help "), Some(ChannelCommand::Help));
+    assert_eq!(feishu.command("/help now"), None);
+    for command in [
+        "/compact",
+        "/compact keep decisions",
+        "/status",
+        "/model",
+        "/think high",
+    ] {
+        assert_eq!(
+            feishu.command(command),
+            None,
+            "the kernel still owns {command}"
+        );
+    }
     assert_eq!(feishu.command("new"), None);
     assert_eq!(feishu.command("stop"), None);
     assert_eq!(feishu.command("/new now"), None);
@@ -184,12 +203,41 @@ fn terminal_controls_can_be_extended_from_feishu_settings() {
         command_mappings: BTreeMap::from([
             ("/fresh".into(), "/clear".into()),
             ("halt".into(), "escape".into()),
+            ("commands".into(), "/help".into()),
         ]),
+        sync_slash_commands: false,
     });
     assert_eq!(feishu.command("/fresh"), Some(ChannelCommand::NewSession));
     assert_eq!(feishu.command("/halt"), Some(ChannelCommand::Stop));
+    assert_eq!(feishu.command("/commands"), Some(ChannelCommand::Help));
     assert_eq!(feishu.command("fresh"), None);
     assert_eq!(feishu.command("halt"), None);
+}
+
+#[tokio::test]
+async fn command_registration_is_opt_in_and_permission_failure_is_nonfatal() {
+    let server = MockServer::start().await;
+    let mut feishu = feishu(&server).await;
+    feishu.register_commands().await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/open-apis/application/v7/app_slash_commands"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": 99991672, "msg": "missing scope"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    feishu.sync_slash_commands = true;
+    feishu.register_commands().await;
+    assert_eq!(server.received_requests().await.expect("requests").len(), 2);
 }
 
 #[tokio::test]

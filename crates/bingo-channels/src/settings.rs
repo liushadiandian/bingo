@@ -100,6 +100,10 @@ pub struct FeishuChannel {
     /// `/clear` and `/stop` to `esc`.
     #[serde(default)]
     pub command_mappings: BTreeMap<String, String>,
+    /// Add missing common commands to the app's native slash-command menu.
+    /// Opt-in because registration writes to the Feishu app, not this chat.
+    #[serde(default)]
+    pub sync_slash_commands: bool,
 }
 
 /// Where an attachment a Feishu message carried lands, under the data
@@ -134,6 +138,7 @@ impl FeishuChannel {
                 .join(Feishu::ID)
                 .join(ATTACHMENTS),
             command_mappings: self.command_mappings.clone(),
+            sync_slash_commands: self.sync_slash_commands,
         }
     }
 }
@@ -300,6 +305,27 @@ mod tests {
         assert_eq!(settings.channels.gate(), Gate::default());
         assert!(!wanted(&json!({})));
         assert!(!wanted(&json!({ "channels": {} })));
+    }
+
+    #[test]
+    fn native_command_registration_requires_explicit_opt_in() {
+        let defaults = parse(json!({ "channels": { "feishu": {} } }));
+        assert!(
+            !defaults
+                .channels
+                .feishu
+                .expect("configured")
+                .sync_slash_commands
+        );
+        let enabled = parse(json!({ "channels": { "feishu": { "syncSlashCommands": true } } }));
+        assert!(
+            enabled
+                .channels
+                .feishu
+                .expect("configured")
+                .config(&env())
+                .sync_slash_commands
+        );
     }
 
     #[test]

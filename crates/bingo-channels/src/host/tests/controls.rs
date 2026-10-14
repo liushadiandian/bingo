@@ -1,5 +1,20 @@
 use super::*;
 
+#[tokio::test]
+async fn help_is_a_surface_reply_not_a_model_prompt() {
+    let chat = Chat::open();
+    chat.say(said(Conversation::direct("oc_1"), "/help", true))
+        .await;
+    let session = chat.session("loopback/oc_1").await;
+    let records = chat.records(1).await;
+    assert!(session.prompts().is_empty());
+    assert!(records.iter().any(|record| matches!(record,
+        Record::Send { text, mode: Mode::Once, .. }
+            if text.starts_with("/new - ") && text.contains("/compact [instructions]")
+                && text.contains("/help - ")
+    )));
+}
+
 async fn switched(chat: &Chat) -> Vec<Record> {
     chat.until(|| {
         let records = chat.loopback.records();

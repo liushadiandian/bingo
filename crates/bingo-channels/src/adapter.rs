@@ -91,6 +91,7 @@ pub enum Mode {
 pub enum ChannelCommand {
     NewSession,
     Stop,
+    Help,
 }
 
 #[async_trait]

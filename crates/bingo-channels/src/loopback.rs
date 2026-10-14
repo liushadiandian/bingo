@@ -383,6 +383,7 @@ impl ChannelAdapter for Loopback {
         match text.trim() {
             "/new" => Some(ChannelCommand::NewSession),
             "/stop" => Some(ChannelCommand::Stop),
+            "/help" => Some(ChannelCommand::Help),
             _ => None,
         }
     }
