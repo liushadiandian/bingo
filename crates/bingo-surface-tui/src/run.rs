@@ -699,20 +699,31 @@ impl Run {
             Effect::Open(selector) => self.open(selector),
             Effect::ListSessions => self.list_sessions(),
             Effect::ListStored => self.list_stored(),
-            Effect::Copy(text) => self.clipboard = Some(text),
-            Effect::PasteImage => self.paste_image(),
+            Effect::Copy(text) => {
+                clipboard::copy_to_clipboard(&mut self.clipboard, text, clipboard::set_text);
+            }
+            Effect::PasteClipboard => self.paste_clipboard(),
             Effect::OpenPicture(source) => showing::open(self, &source),
             Effect::Exit => self.exit = Some(Exit { code: 0 }),
         }
     }
 
-    /// A picture on the clipboard is written out as a file at once
-    /// (ADR-0052 §1), becomes `[image N]` in the line, and that file is held
-    /// under the token; a clipboard with none leaves the line alone.
-    fn paste_image(&mut self) {
-        let Some(bytes) = clipboard::image() else {
-            return;
-        };
+    /// Clipboard text lands at the caret; an image becomes a saved token.
+    /// The image is written under the data directory (ADR-0052 §1) and
+    /// held under its `[image N]` token; empty contents leave the draft alone.
+    fn paste_clipboard(&mut self) {
+        match clipboard::content() {
+            #[cfg(any(windows, test))]
+            Some(clipboard::Content::Text(text)) => {
+                self.ui.composer.insert(&text);
+                self.ui.edited();
+            }
+            Some(clipboard::Content::Image(bytes)) => self.paste_picture(bytes),
+            None => {}
+        }
+    }
+
+    fn paste_picture(&mut self, bytes: Vec<u8>) {
         match pasted(&self.data_dir, &bytes) {
             Ok(path) => {
                 let n = self.ui.pictures.hold(self.ui.composer.text(), path);

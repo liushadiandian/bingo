@@ -28,12 +28,12 @@ pub enum Effect {
     ListSessions,
     /// Fill the switcher's stored rows from the host: one read per opening.
     ListStored,
-    /// Put a selection on the terminal's own clipboard (OSC 52). The loop
-    /// says so when the terminal will not take it.
+    /// Put a selection on the system clipboard, falling back to OSC 52. The loop
+    /// owns both roads.
     Copy(String),
-    /// Ask the system clipboard for a picture and, if there is one, put
-    /// `[image N]` in the line for it (ADR-0040). The loop owns the read.
-    PasteImage,
+    /// Ask the clipboard for text or a picture and insert it in the composer.
+    /// Images become `[image N]` tokens (ADR-0040). The loop owns the read.
+    PasteClipboard,
     /// Show a picture a click landed on in whatever this system opens pictures
     /// with (M56). The loop resolves the source to a file on this machine —
     /// the path the words named, or the one it writes the bytes to — and hands

@@ -57,6 +57,13 @@ pub fn on_key(ui: &mut Ui, tree: &Tree, key: KeyEvent, now: Now) -> Vec<Effect> 
     // one gesture.
     ui.esc_armed &= key.code == KeyCode::Esc;
     let state = tree.viewed();
+    // An active transcript selection gives ctrl+c its copy meaning.
+    if ui.select.run.is_some()
+        && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return selecting(ui, tree, key, now);
+    }
     if let Some(effects) = leaving(ui, state, key, now) {
         return effects;
     }
@@ -686,7 +693,7 @@ fn control(ui: &mut Ui, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Char('w') => edit(ui, |c| c.delete_word_left()),
         KeyCode::Char('u') => edit(ui, |c| c.delete_to_line_start()),
         KeyCode::Char('k') => edit(ui, |c| c.delete_to_line_end()),
-        KeyCode::Char('v') => return vec![Effect::PasteImage],
+        KeyCode::Char('v') => return vec![Effect::PasteClipboard],
         // Claude Code's own key for its own list (M74): the rows go off the
         // band and come back, and nothing opens.
         KeyCode::Char('t') => ui.tasks_hidden = !ui.tasks_hidden,
@@ -699,6 +706,7 @@ fn alt(ui: &mut Ui, key: KeyEvent) -> Vec<Effect> {
     match key.code {
         KeyCode::Char('b') => ui.composer.word_left(),
         KeyCode::Char('f') => ui.composer.word_right(),
+        KeyCode::Char('v') => return vec![Effect::PasteClipboard],
         KeyCode::Enter => newline(ui),
         _ => {}
     }
@@ -985,13 +993,29 @@ mod tests {
     }
 
     /// `ctrl+v` asks the loop for the clipboard; the line is untouched until
-    /// the loop has a picture to put in it.
+    /// the loop has text or a picture to put in it.
     #[test]
     fn ctrl_v_asks_for_the_clipboard() {
         let (mut ui, now) = scene();
         let tree = solo(&state());
         let effects = on_key(&mut ui, &tree, ctrl('v'), now);
-        assert_eq!(effects, vec![Effect::PasteImage]);
+        assert_eq!(effects, vec![Effect::PasteClipboard]);
+        assert!(ui.composer.is_empty());
+    }
+
+    #[test]
+    fn alt_v_also_asks_for_the_clipboard() {
+        let (mut ui, now) = scene();
+        let tree = solo(&state());
+        assert_eq!(
+            on_key(
+                &mut ui,
+                &tree,
+                crate::test_support::alt(KeyCode::Char('v')),
+                now
+            ),
+            vec![Effect::PasteClipboard]
+        );
         assert!(ui.composer.is_empty());
     }
 
@@ -2292,27 +2316,29 @@ mod tests {
     // ---- selection and the clipboard ------------------------------------
 
     #[test]
-    fn v_starts_a_run_the_arrows_extend_and_y_copies_it() {
+    fn v_starts_a_run_the_arrows_extend_and_y_or_ctrl_c_copies_it() {
         let state = long_transcript(60);
-        let (mut ui, now) = scene();
-        render(&state, &ui, now);
-        press(&mut ui, &state, key(KeyCode::PageUp), now);
-        render(&state, &ui, now);
-        press(&mut ui, &state, typed('v'), now);
-        assert!(ui.select.run.is_some(), "v starts one while reading back");
+        for copy_key in [typed('y'), ctrl('c')] {
+            let (mut ui, now) = scene();
+            render(&state, &ui, now);
+            press(&mut ui, &state, key(KeyCode::PageUp), now);
+            render(&state, &ui, now);
+            press(&mut ui, &state, typed('v'), now);
+            assert!(ui.select.run.is_some(), "v starts one while reading back");
 
-        press(&mut ui, &state, key(KeyCode::Down), now);
-        press(&mut ui, &state, key(KeyCode::Right), now);
-        let copied = press(&mut ui, &state, typed('y'), now);
-        let [Effect::Copy(text)] = copied.as_slice() else {
-            panic!("y copies: {copied:?}")
-        };
-        assert_eq!(
-            text.lines().count(),
-            2,
-            "a run of two lines, cut where the far end is: {text:?}"
-        );
-        assert!(ui.select.run.is_none(), "copying lets it go");
+            press(&mut ui, &state, key(KeyCode::Down), now);
+            press(&mut ui, &state, key(KeyCode::Right), now);
+            let copied = press(&mut ui, &state, copy_key, now);
+            let [Effect::Copy(text)] = copied.as_slice() else {
+                panic!("the selection key copies: {copied:?}")
+            };
+            assert_eq!(
+                text.lines().count(),
+                2,
+                "a run of two lines, cut where the far end is: {text:?}"
+            );
+            assert!(ui.select.run.is_none(), "copying lets it go");
+        }
     }
 
     /// A page back, settled, so a run started at the top of the screen has

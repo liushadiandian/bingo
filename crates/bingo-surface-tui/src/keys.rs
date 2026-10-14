@@ -34,7 +34,7 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "ctrl+c",
-        description: "interrupt · clear input · twice to exit",
+        description: "interrupt · clear input · copy selection · twice to exit",
     },
     Binding {
         keys: "ctrl+d",
@@ -59,6 +59,10 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "ctrl+w/u/k",
         description: "delete word · to line start · to line end",
+    },
+    Binding {
+        keys: "ctrl+v · alt+v",
+        description: "Windows: text first · otherwise paste image",
     },
     Binding {
         keys: "pgup/pgdn",

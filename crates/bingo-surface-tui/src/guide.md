@@ -21,9 +21,9 @@ where you are, the window used against the whole, and the model.
   row says `Stopping…` from the frame the key was pressed.
 - `esc esc` — on an empty composer, the turns of this transcript newest first,
   and `⏎` to rewind to one. Offered only where the session has a `/rewind`.
-- `ctrl+c` — interrupt a running turn; with nothing running, clear the input;
-  with nothing to clear it says how to leave, and again within the moment
-  leaves. `ctrl+d` — exit on an empty input.
+- `ctrl+c` — copy an active transcript selection; otherwise interrupt a
+  running turn, clear the input when idle, or press twice to exit on an empty
+  input. `ctrl+d` — exit on an empty input.
 - `tab` — a second ordered stack: take the dropdown's row, else queue the line
   for after the running turn, else move the ring to the next card that answers
   keys. `⏎` while a turn runs *steers* it — the turn absorbs the line at its
@@ -32,6 +32,10 @@ where you are, the window used against the whole, and the model.
   `down` on an empty box walks the sessions, the same list `ctrl+g` opens.
 - `ctrl+a/e` — start and end of the line (`home` and `end` too). `alt+b/f` —
   one word. `ctrl+w/u/k` — delete a word, to the line start, to the line end.
+- `ctrl+v · alt+v` — on Windows, paste clipboard text at the caret, or an image
+  when there is no text. Elsewhere these chords paste images. Bracketed terminal
+  text paste remains supported; the terminal host must pass an image-paste
+  chord through to Bingo.
 - `pgup/pgdn` — scroll the transcript. While it is held back, the row under it
   says `↓ 37 lines below`; `end`, or a click on that row, follows the foot again.
 - `v · drag` — select: from the focused block or the first line on the screen
@@ -39,8 +43,9 @@ where you are, the window used against the whole, and the model.
   drag itself take the far end of the run and the view follows it, so a run
   reaches what has scrolled away; held past the top or the foot of the
   transcript, a drag scrolls it a line at a time until you come back inside or
-  let go. `y`, `ctrl+c` or letting the button up copies through OSC 52 and
-  lets the run go; `esc` lets it go and copies nothing. What is copied is what
+  let go. `y`, `ctrl+c` or letting the button up copies to the Windows system
+  clipboard on Windows (or OSC 52 if unavailable); elsewhere OSC 52 is used.
+  Copying lets the run go; `esc` lets it go and copies nothing. What is copied is what
   was drawn: the cells as you saw them, trailing spaces trimmed. More than
   100 KiB is refused out loud rather than half-copied.
 - `ctrl+t` — show and hide the task list. `ctrl+p` — the plugin-state sheet:
