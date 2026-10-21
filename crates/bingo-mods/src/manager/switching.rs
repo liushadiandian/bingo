@@ -6,6 +6,8 @@ use bingo_sdk::plugin::PluginSwitch;
 pub(super) struct State {
     pub off: RwLock<BTreeSet<String>>,
     pub retired: tokio::sync::Mutex<Vec<Arc<Module>>>,
+    // Storage outlives every generation, including removals and disabled modules.
+    pub stores: Mutex<BTreeMap<String, Store>>,
     pub requests: Mutex<BTreeMap<String, Arc<Request>>>,
     pub changed: tokio::sync::Notify,
 }
@@ -141,14 +143,8 @@ pub(super) async fn switch_module(
         .get(&old.found.name)
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let module = Module::load(
-        found,
-        config,
-        manager.limits.clone(),
-        &manager.env,
-        !enabled,
-    )
-    .await;
+    let store = manager.store(&found.name);
+    let module = Module::load(found, config, manager.limits.clone(), store, !enabled).await;
     // A previously unloaded module has no hook metadata until register has run.
     let kind = classify(manager, &module);
     if enabled && kind != PluginSwitch::Now {

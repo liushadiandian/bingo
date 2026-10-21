@@ -17,12 +17,6 @@ async fn fixture() -> (tempfile::TempDir, Arc<Manager>, Arc<Module>) {
     .unwrap();
     let found = discovery::read(&directory, &Notices::default()).unwrap();
     let env = Env::rooted(root.path());
-    let module = Module::load(found, json!({}), Limits::default(), &env, false).await;
-    assert!(module.engine.is_some());
-    module.admission.finish(Ok(PluginGrant {
-        tier: Tier::Rewrite,
-        uses: Default::default(),
-    }));
     let manager = Arc::new(Manager::new(
         env,
         vec![],
@@ -30,6 +24,19 @@ async fn fixture() -> (tempfile::TempDir, Arc<Manager>, Arc<Module>) {
         Default::default(),
         Limits::default(),
     ));
+    let module = Module::load(
+        found,
+        json!({}),
+        Limits::default(),
+        manager.store("fixture"),
+        false,
+    )
+    .await;
+    assert!(module.engine.is_some());
+    module.admission.finish(Ok(PluginGrant {
+        tier: Tier::Rewrite,
+        uses: Default::default(),
+    }));
     manager.modules.write().unwrap().push(module.clone());
     (root, manager, module)
 }
@@ -406,7 +413,7 @@ async fn retiring_an_old_generation_preserves_the_new_generations_process() {
         old.found.clone(),
         json!({}),
         Limits::default(),
-        &manager.env,
+        manager.store("fixture"),
         false,
     )
     .await;

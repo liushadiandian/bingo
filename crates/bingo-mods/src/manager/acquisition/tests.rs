@@ -338,3 +338,56 @@ async fn an_abandoned_registration_cannot_hold_reload_or_shutdown_forever() {
         fixture.manager.stop().await;
     }
 }
+
+#[tokio::test]
+async fn retired_generations_cannot_forget_replacement_subscriptions() {
+    for mode in ["rescan", "root", "remove-readd"] {
+        let fixture = Fixture::new().await;
+        fixture.host.on_sessions(|_| async { Ok(vec![]) });
+        let old = fixture.manager.modules()[0].clone();
+        let session = SessionId::mint();
+        fixture.edit();
+        match mode {
+            "root" => fixture.manager.reload_root(&fixture.root).await.unwrap(),
+            "remove-readd" => {
+                let manifest = fixture.root.join("plugin.json");
+                let source = std::fs::read(&manifest).unwrap();
+                std::fs::remove_file(&manifest).unwrap();
+                fixture.manager.rescan(true).await.unwrap();
+                std::fs::write(&manifest, source).unwrap();
+                fixture.manager.rescan(true).await.unwrap();
+            }
+            _ => {
+                fixture.manager.rescan(true).await.unwrap();
+            }
+        }
+        let replacement = fixture.manager.modules()[0].clone();
+        assert_ne!(old.generation, replacement.generation);
+        assert!(!old.engine.as_ref().unwrap().stopped().is_cancelled());
+        replacement
+            .store
+            .subscribe(
+                &fixture.host.handle(),
+                session.clone(),
+                "pane".into(),
+                vec![bingo_plugin_host::state::Read {
+                    plugin: "fixture".into(),
+                    scope: "global".into(),
+                    key: "count".into(),
+                    version: None,
+                }],
+            )
+            .await
+            .unwrap();
+        old.store.forget(&session, "pane");
+        replacement
+            .store
+            .changed(&fixture.host.handle(), "global", "count")
+            .await
+            .unwrap();
+        assert!(fixture.host.calls().iter().any(|call| matches!(call,
+            testing::HostCall::Invalidate { session: seen, requests } if seen == &session && requests == &["pane"]
+        )), "{mode}: retired generation forgot the replacement's subscription");
+        fixture.manager.stop().await;
+    }
+}

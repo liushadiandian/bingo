@@ -187,7 +187,8 @@ impl Manager {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&found.name);
-        let module = Module::load(found, config, self.limits.clone(), &self.env, off).await;
+        let store = self.store(&found.name);
+        let module = Module::load(found, config, self.limits.clone(), store, off).await;
         if let Some(old) = old {
             let mut retired = self.switches.retired.lock().await;
             self.replace(old, module.clone());

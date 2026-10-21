@@ -74,6 +74,8 @@ struct Gates {
     start: Gate,
     callback: Gate,
     timer: Gate,
+    state: Option<tokio::sync::Barrier>,
+    state_stop: CancellationToken,
     ready: Notify,
     inspect_dispatch: AtomicBool,
     dispatch_pending: AtomicBool,
@@ -89,6 +91,12 @@ impl WireService for Gates {
             Some("start") => self.start.wait().await,
             Some("callback") => self.callback.wait().await,
             Some("timer") => self.timer.wait().await,
+            Some("state") => {
+                tokio::select! {
+                    _ = self.state.as_ref().unwrap().wait() => {},
+                    _ = self.state_stop.cancelled() => {},
+                }
+            }
             Some("ready") => self.ready.notify_one(),
             other => panic!("unknown barrier: {other:?}"),
         }
@@ -229,7 +237,7 @@ impl Fixture {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join("plugin.json"),
-            json!({"name":"fixture","version":"1","module":"main.ts","uses":["command","tool","gate","clock"]}).to_string(),
+            json!({"name":"fixture","version":"1","module":"main.ts","uses":["command","tool","gate","clock","state"]}).to_string(),
         ).unwrap();
         std::fs::write(root.join("main.ts"), source).unwrap();
         let plugin = ModsPlugin::default()
@@ -339,6 +347,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.gates.state_stop.cancel();
         for gate in [
             &self.gates.source,
             &self.gates.start,
@@ -491,6 +500,64 @@ async fn reload_cancels_old_timers_without_cancelling_acquired_commands() {
     applied(fixture.ack(&intent).await, "old");
     retired(stopped).await;
     applied(fixture.command("/ledger").await, "new");
+    fixture.host.shutdown().await;
+}
+
+const SHARED_STATE: &str = r#"
+async function write($, generation) {
+  const held = await $.state.get('shared');
+  await $.gate.wait({phase:'state'});
+  let won = false;
+  try { await $.state.set('shared', generation, held.version); won = true; }
+  catch (error) { if (!error.message.includes('version conflict')) throw error; }
+  await $.gate.wait({phase:'state'});
+  await $.state.set(generation, won);
+}
+export function register(on) {
+  const generation = 'old';
+  on('session.start', async $ => {
+    await $.gate.wait({phase:'start'});
+    if (generation === "old") await $.state.set('shared', 'initial');
+    else await write($, generation);
+    await $.command.register({name:'ledger'}, async $ => {
+      if (generation === "old") {
+        await $.gate.wait({phase:'callback'});
+        await write($, generation);
+        return {kind:'applied',message:generation};
+      }
+      const values = await Promise.all(['shared', "old", "new"].map(key => $.state.get(key)));
+      return {kind:'applied',message:JSON.stringify(values)};
+    });
+    await $.gate.wait({phase:'ready'});
+  });
+}
+"#;
+
+#[tokio::test]
+async fn acquired_callback_and_replacement_startup_share_atomic_state() {
+    let gates = Arc::new(Gates {
+        state: Some(tokio::sync::Barrier::new(2)),
+        ..Default::default()
+    });
+    let mut fixture = Fixture::with_source(Driver::Log, SHARED_STATE, gates.clone()).await;
+    gates.callback.arm();
+    let intent = fixture.submit("/ledger");
+    finish(gates.callback.entered.notified()).await;
+    let reload = fixture.replacing().await;
+    gates.start.release.notify_one();
+    gates.callback.release.notify_one();
+    applied(fixture.ack(&intent).await, "old");
+    finish(reload).await.unwrap().unwrap();
+    let IntentOutcome::Applied { result } = fixture.command("/ledger").await else {
+        panic!("replacement could not read the shared state");
+    };
+    let values: Vec<Value> = serde_json::from_str(result["message"].as_str().unwrap()).unwrap();
+    assert_eq!(values[0]["version"], 2);
+    assert_eq!(values[1]["version"], 1);
+    assert_eq!(values[2]["version"], 1);
+    let old_won = values[1]["value"].as_bool().unwrap();
+    assert_eq!(values[2]["value"], !old_won);
+    assert_eq!(values[0]["value"], if old_won { "old" } else { "new" });
     fixture.host.shutdown().await;
 }
 

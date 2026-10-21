@@ -18,7 +18,7 @@ impl Module {
         found: Found,
         config: Value,
         limits: Limits,
-        env: &Env,
+        store: Store,
         switched_off: bool,
     ) -> Arc<Self> {
         let admission = Admission::default();
@@ -48,7 +48,7 @@ impl Module {
         };
         Arc::new(Self {
             generation: ItemId::mint(),
-            store: Store::new(&env.data_dir, &found.name),
+            store,
             found,
             admission,
             engine,

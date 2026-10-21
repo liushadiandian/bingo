@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bingo_plugin_host::{
     discovery,
     notice::{self, Notice, Notices},
+    state::Store,
 };
 use bingo_sdk::*;
 use serde_json::Value;
@@ -113,7 +114,8 @@ impl Manager {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&found.name);
-            let module = Module::load(found, config, self.limits.clone(), &self.env, off).await;
+            let store = self.store(&found.name);
+            let module = Module::load(found, config, self.limits.clone(), store, off).await;
             if !off && let Err(reason) = module.admission.decision() {
                 self.notices.push(Notice::warn("PLUGIN_UNREADABLE", reason));
             }
@@ -154,6 +156,17 @@ impl Manager {
             ),
         )
         .await
+    }
+    fn store(&self, name: &str) -> Store {
+        // Generations overlap, and cancelled calls may still have a blocking
+        // write in flight. Keep one serializer per plugin across every generation.
+        self.switches
+            .stores
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(name.into())
+            .or_insert_with(|| Store::new(&self.env.data_dir, name))
+            .fork()
     }
     pub(crate) fn env(&self) -> &Env {
         &self.env
