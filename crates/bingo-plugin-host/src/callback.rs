@@ -19,20 +19,51 @@ pub trait Executor: Send + Sync {
     async fn prepare(&self) -> Result<(), String>;
     async fn call(&self, id: &str, input: Value, cx: &HookContext) -> Result<Value, String>;
 }
+/// Resolves named dispatch even while its previous runtime is being replaced.
+#[async_trait::async_trait]
+pub trait Resolver: Send + Sync {
+    async fn acquire(&self, plugin: &str) -> Result<Arc<dyn Executor>, String>;
+}
 #[derive(Default)]
-pub struct Registry(RwLock<BTreeMap<String, Vec<Arc<dyn Executor>>>>);
+struct Owner {
+    executors: Vec<Arc<dyn Executor>>,
+    resolver: Option<Arc<dyn Resolver>>,
+}
+#[derive(Default)]
+pub struct Registry(RwLock<BTreeMap<String, Owner>>);
 impl Registry {
     pub fn insert(&self, plugin: String, executor: Arc<dyn Executor>) {
+        self.publish(plugin, executor, None);
+    }
+    pub fn insert_resolved(
+        &self,
+        plugin: String,
+        executor: Arc<dyn Executor>,
+        resolver: Arc<dyn Resolver>,
+    ) {
+        self.publish(plugin, executor, Some(resolver));
+    }
+    fn publish(
+        &self,
+        plugin: String,
+        executor: Arc<dyn Executor>,
+        resolver: Option<Arc<dyn Resolver>>,
+    ) {
         let mut owners = self.0.write().unwrap_or_else(|error| error.into_inner());
-        let entries = owners.entry(plugin).or_default();
-        entries.retain(|entry| entry.generation() != executor.generation());
-        entries.push(executor);
+        let owner = owners.entry(plugin).or_default();
+        owner
+            .executors
+            .retain(|entry| entry.generation() != executor.generation());
+        owner.executors.push(executor);
+        owner.resolver = resolver;
     }
     pub fn remove_generation(&self, plugin: &str, generation: &bingo_sdk::ItemId) {
         let mut owners = self.0.write().unwrap_or_else(|error| error.into_inner());
-        if let Some(entries) = owners.get_mut(plugin) {
-            entries.retain(|entry| entry.generation().as_ref() != Some(generation));
-            if entries.is_empty() {
+        if let Some(owner) = owners.get_mut(plugin) {
+            owner
+                .executors
+                .retain(|entry| entry.generation().as_ref() != Some(generation));
+            if owner.executors.is_empty() && owner.resolver.is_none() {
                 owners.remove(plugin);
             }
         }
@@ -51,6 +82,7 @@ impl Registry {
             .get(plugin)
             .and_then(|entries| {
                 entries
+                    .executors
                     .iter()
                     .rev()
                     .find(|executor| {
@@ -68,6 +100,18 @@ impl Registry {
         }))
     }
     pub async fn prepared(&self, plugin: &str) -> Result<Arc<dyn Executor>, String> {
+        let resolver = self
+            .0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(plugin)
+            .and_then(|owner| owner.resolver.clone());
+        if let Some(resolver) = resolver {
+            return Ok(Arc::new(Bound {
+                plugin: plugin.into(),
+                executor: resolver.acquire(plugin).await?,
+            }));
+        }
         self.get(plugin)?.prepare().await?;
         self.get(plugin)
     }

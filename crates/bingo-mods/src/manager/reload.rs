@@ -9,9 +9,8 @@ pub(super) struct Watch {
     stale: bool,
 }
 impl Manager {
-    pub(crate) async fn prepare(&self) {
-        self.poll().await;
-        self.reload_stale().await;
+    pub(crate) async fn prepare(&self) -> Result<(), String> {
+        acquisition::prepare(self).await
     }
     pub(super) fn watch(self: &Arc<Self>) {
         self.baseline(true);
@@ -29,7 +28,7 @@ impl Manager {
             }
         }));
     }
-    async fn poll(&self) {
+    pub(super) async fn poll(&self) {
         let mut roots: Vec<_> = self
             .modules()
             .iter()
@@ -64,7 +63,7 @@ impl Manager {
             }
         }
     }
-    async fn reload_stale(&self) {
+    pub(super) async fn reload_stale(&self) {
         let stale = self
             .watches
             .lock()
@@ -134,7 +133,17 @@ impl Manager {
             .unwrap_or_else(|error| error.into_inner()) = watches;
     }
     pub async fn reload_root(&self, root: &Path) -> Result<(), KernelError> {
+        let manager = self
+            .this
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| failed("module manager is unavailable"))?;
+        let root = root.to_path_buf();
+        acquisition::run(self, async move { manager.reload_one(&root).await }).await?
+    }
+    async fn reload_one(&self, root: &Path) -> Result<(), KernelError> {
         let _guard = self.reloading.lock().await;
+        switching::running(self)?;
         let root = root.canonicalize().map_err(failed)?;
         let old = self
             .modules()
@@ -158,11 +167,14 @@ impl Manager {
         }
         let result = self.install_generation(found, Some(&old)).await;
         self.catalogues_changed();
+        let name = old.found.name.clone();
+        drop(old);
+        switching::reap_locked(self).await;
         result?;
         self.baseline(false);
         self.notices.push(Notice::warn(
             "PLUGIN_RELOADED",
-            format!("the {} plugin reloaded", old.found.name),
+            format!("the {name} plugin reloaded"),
         ));
         Ok(())
     }

@@ -22,11 +22,12 @@ struct Named<T> {
     plugin: String,
     callback: String,
     spec: T,
-    stopped: CancellationToken,
+    executor: Arc<dyn callback::Executor>,
     registry: Arc<Registry>,
 }
+type RegistrationKey = (String, Option<ItemId>, String);
 #[derive(Default)]
-pub struct Registrations(Mutex<BTreeMap<(String, String), Named<Spec>>>);
+pub struct Registrations(Mutex<BTreeMap<RegistrationKey, Named<Spec>>>);
 impl Registrations {
     pub fn tool(&self, caller: &Caller, input: RegisterTool) -> Result<String, String> {
         let name = tool_name(&caller.plugin, &input.spec.name);
@@ -52,24 +53,27 @@ impl Registrations {
             .host
             .service(&callback::KEY)
             .ok_or("callback registry is unavailable")?;
-        let stopped = registry.get(&caller.plugin)?.stopped();
+        let executor = registry.get(&caller.plugin)?;
         let named = Named {
             plugin: caller.plugin.clone(),
             callback: callback.clone(),
             spec,
-            stopped,
+            executor,
             registry,
         };
         let mut entries = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        entries.retain(|_, entry| !entry.stopped.is_cancelled());
-        entries.insert((caller.plugin.clone(), callback), named);
+        entries.retain(|_, entry| !entry.executor.stopped().is_cancelled());
+        entries.insert(
+            (caller.plugin.clone(), named.executor.generation(), callback),
+            named,
+        );
         Ok(())
     }
     pub fn remove(&self, plugin: &str) {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(owner, _), _| owner != plugin);
+            .retain(|(owner, _, _), _| owner != plugin);
     }
     pub fn has_tools(&self, plugin: &str) -> bool {
         self.0
@@ -77,9 +81,7 @@ impl Registrations {
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|entry| {
-                entry.plugin == plugin
-                    && matches!(entry.spec, Spec::Tool(_))
-                    && !entry.stopped.is_cancelled()
+                entry.plugin == plugin && matches!(entry.spec, Spec::Tool(_)) && entry.available()
             })
     }
     pub fn contents(&self, plugin: &str) -> plugin::PluginContents {
@@ -87,7 +89,7 @@ impl Registrations {
         let mut contents = plugin::PluginContents::default();
         for entry in entries
             .values()
-            .filter(|entry| entry.plugin == plugin && !entry.stopped.is_cancelled())
+            .filter(|entry| entry.plugin == plugin && entry.available())
         {
             match &entry.spec {
                 Spec::Command(spec) if !spec.hidden => contents.commands.push(spec.clone()),
@@ -103,7 +105,7 @@ impl Registrations {
             .unwrap_or_else(|error| error.into_inner())
             .values()
             .filter_map(|entry| match &entry.spec {
-                Spec::Tool(spec) if !entry.stopped.is_cancelled() => {
+                Spec::Tool(spec) if entry.available() => {
                     Some(Arc::new(RegisteredTool(entry.with_spec(spec.clone()))) as Arc<dyn Tool>)
                 }
                 _ => None,
@@ -116,7 +118,7 @@ impl Registrations {
             .unwrap_or_else(|error| error.into_inner())
             .values()
             .filter_map(|entry| match &entry.spec {
-                Spec::Command(spec) if !entry.stopped.is_cancelled() => {
+                Spec::Command(spec) if entry.available() => {
                     Some(Arc::new(RegisteredCommand(entry.with_spec(spec.clone())))
                         as Arc<dyn Command>)
                 }
@@ -126,12 +128,15 @@ impl Registrations {
     }
 }
 impl<T> Named<T> {
+    fn available(&self) -> bool {
+        self.executor.is_current() && !self.executor.stopped().is_cancelled()
+    }
     fn with_spec<S>(&self, spec: S) -> Named<S> {
         Named {
             plugin: self.plugin.clone(),
             callback: self.callback.clone(),
             spec,
-            stopped: self.stopped.clone(),
+            executor: self.executor.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -230,6 +235,87 @@ mod tests {
                 .unwrap_err();
             assert!(!refused.contains("controls"), "{own}: {refused}");
         }
+        assert!(registrations.commands().is_empty());
+    }
+
+    struct Generation {
+        id: ItemId,
+        current: std::sync::atomic::AtomicBool,
+        stopped: CancellationToken,
+    }
+    impl Generation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                id: ItemId::mint(),
+                current: std::sync::atomic::AtomicBool::new(true),
+                stopped: CancellationToken::new(),
+            })
+        }
+        fn retire(&self) {
+            self.current
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl callback::Executor for Generation {
+        fn stopped(&self) -> CancellationToken {
+            self.stopped.clone()
+        }
+        fn generation(&self) -> Option<ItemId> {
+            Some(self.id.clone())
+        }
+        fn is_current(&self) -> bool {
+            self.current.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn prepare(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn call(&self, _: &str, _: Value, _: &HookContext) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+    }
+    #[tokio::test]
+    async fn retiring_names_disappear_and_late_registration_cannot_replace_new_names() {
+        let root = tempfile::tempdir().unwrap();
+        let host = testing::TestHost::default();
+        let registry = Arc::new(Registry::default());
+        host.services()
+            .add(
+                callback::KEY.name().into(),
+                service::Service {
+                    value: Arc::new(registry.clone()),
+                    wire: None,
+                },
+            )
+            .unwrap();
+        let caller = Caller {
+            host: host.handle(),
+            ..caller(root.path())
+        };
+        let registrations = Registrations::default();
+        let old = Generation::new();
+        registry.insert("aaa".into(), old.clone());
+        registrations.command(&caller, named("old", &[])).unwrap();
+        old.retire();
+        assert!(registrations.commands().is_empty());
+        assert!(registrations.contents("aaa").commands.is_empty());
+        assert!(
+            !old.stopped.is_cancelled(),
+            "retired callback is still leased"
+        );
+        let new = Generation::new();
+        registry.insert("aaa".into(), new.clone());
+        registrations.command(&caller, named("new", &[])).unwrap();
+        generation::scope("aaa", &old.id, async {
+            registrations
+                .command(&caller, named("late-old", &[]))
+                .unwrap();
+        })
+        .await;
+        let commands = registrations.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].spec().name, "new");
+        new.retire();
         assert!(registrations.commands().is_empty());
     }
 }

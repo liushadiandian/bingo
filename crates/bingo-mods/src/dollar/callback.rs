@@ -3,18 +3,30 @@ use crate::{manager::Manager, module::Module};
 use bingo_plugin_host::callback::Executor;
 use bingo_sdk::*;
 use serde_json::{Value, json};
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 pub(crate) struct Native {
-    pub module: Weak<Module>,
+    pub module: Owner,
     pub generation: ItemId,
     pub manager: Weak<Manager>,
+}
+pub(crate) enum Owner {
+    Watching(Weak<Module>),
+    Acquired(Arc<Module>),
+}
+impl Owner {
+    fn get(&self) -> Option<Arc<Module>> {
+        match self {
+            Self::Watching(module) => module.upgrade(),
+            Self::Acquired(module) => Some(module.clone()),
+        }
+    }
 }
 #[async_trait::async_trait]
 impl Executor for Native {
     fn stopped(&self) -> CancellationToken {
         self.module
-            .upgrade()
+            .get()
             .and_then(|module| module.engine.as_ref().map(|engine| engine.stopped()))
             .unwrap_or_else(|| {
                 let stop = CancellationToken::new();
@@ -35,13 +47,12 @@ impl Executor for Native {
             .upgrade()
             .ok_or("module manager is unavailable")?
             .prepare()
-            .await;
-        Ok(())
+            .await
     }
     async fn call(&self, id: &str, input: Value, cx: &HookContext) -> Result<Value, String> {
         let module = self
             .module
-            .upgrade()
+            .get()
             .ok_or("module generation is unavailable")?;
         if !module.admission.allowed() {
             return Err("module is not admitted".into());

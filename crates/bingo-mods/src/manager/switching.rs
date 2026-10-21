@@ -207,10 +207,13 @@ async fn activate_switch(
     if owned && let Some(dollar) = manager.dollar.get() {
         dollar.unregister(name);
     }
-    manager.replace(&old, module.clone());
-    wish(manager, name, enabled);
-    if owned {
-        manager.switches.retired.lock().await.push(old);
+    {
+        let mut retired = manager.switches.retired.lock().await;
+        manager.replace(&old, module.clone());
+        wish(manager, name, enabled);
+        if owned {
+            retired.push(old);
+        }
     }
     manager.publish_callbacks(module.clone());
     let host = manager
@@ -254,6 +257,9 @@ async fn wait_retired(manager: &Manager, id: &str, name: &str, request: &Arc<Req
 }
 pub(super) async fn reap(manager: &Manager) {
     let _guard = manager.reloading.lock().await;
+    reap_locked(manager).await;
+}
+pub(super) async fn reap_locked(manager: &Manager) {
     let ready: Vec<_> = manager
         .switches
         .retired
@@ -261,21 +267,28 @@ pub(super) async fn reap(manager: &Manager) {
         .await
         .iter()
         .filter(|module| Arc::strong_count(module) == 1)
-        .cloned()
+        .map(|module| {
+            // Retired acquisition checks this token under the same list lock.
+            // Leave cleanup ownership in the list if this future is cancelled.
+            if let Some(engine) = &module.engine {
+                engine.stopped().cancel();
+            }
+            module.clone()
+        })
         .collect();
     for module in ready {
         module.close().await;
-        // Release only this generation after its last running reference ends.
+        cleanup(manager, &module).await;
         manager
             .switches
             .retired
             .lock()
             .await
             .retain(|entry| !Arc::ptr_eq(entry, &module));
-        cleanup(manager, &module).await;
         manager.switches.changed.notify_waiters();
     }
 }
+
 pub(super) async fn cleanup(manager: &Manager, module: &Module) {
     manager
         .callbacks

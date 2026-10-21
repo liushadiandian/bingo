@@ -57,7 +57,7 @@ async fn cancelling_the_switch_waiter_does_not_lose_the_retiring_generation() {
         tokio::spawn(async move { manager.switch("fixture", false).await })
     };
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while manager.modules()[0].engine.is_some() {
+        while manager.reloading.try_lock().is_ok() {
             tokio::task::yield_now().await;
         }
     })
@@ -67,6 +67,7 @@ async fn cancelling_the_switch_waiter_does_not_lose_the_retiring_generation() {
     let _ = caller.await;
     drop(retired);
     let _completed = manager.reloading.lock().await;
+    assert!(manager.modules()[0].engine.is_none());
     assert!(
         manager
             .switches

@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Duration};
 pub struct Timers(std::sync::Mutex<Vec<Owned>>);
 struct Owned {
     session: SessionId,
+    generation: Option<ItemId>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Timers {
@@ -24,6 +25,12 @@ impl Timers {
         let start = tokio::time::Instant::now()
             .checked_add(period)
             .ok_or("timer deadline is out of range")?;
+        let generation = executor.generation();
+        let mut owned = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if !executor.is_current() || stopped.is_cancelled() {
+            return Err("timer generation is no longer current".into());
+        }
+        owned.retain(|timer| !timer.task.is_finished());
         let task = tokio::spawn(async move {
             let mut clock = tokio::time::interval_at(start, period.max(Duration::from_millis(1)));
             clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -42,27 +49,34 @@ impl Timers {
                 }
             }
         });
-        let mut owned = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        owned.retain(|timer| !timer.task.is_finished());
-        owned.push(Owned { session, task });
+        owned.push(Owned {
+            session,
+            generation,
+            task,
+        });
         Ok(id)
     }
     pub async fn end(&self, session: &SessionId) {
-        self.stop_matching(|id| id == session).await;
+        self.stop_matching(|timer| &timer.session == session).await;
+    }
+    pub async fn retire(&self, generation: &ItemId) {
+        self.stop_matching(|timer| timer.generation.as_ref() == Some(generation))
+            .await;
     }
     pub async fn stop(&self) {
         self.stop_matching(|_| true).await;
     }
-    async fn stop_matching(&self, matches: impl Fn(&SessionId) -> bool) {
+    async fn stop_matching(&self, matches: impl Fn(&Owned) -> bool) {
         let stopped = {
             let mut owned = self.0.lock().unwrap_or_else(|error| error.into_inner());
-            let (stop, keep): (Vec<_>, Vec<_>) =
-                owned.drain(..).partition(|timer| matches(&timer.session));
+            let (stop, keep): (Vec<_>, Vec<_>) = owned.drain(..).partition(|timer| matches(timer));
             *owned = keep;
             stop
         };
-        for timer in stopped {
+        for timer in &stopped {
             timer.task.abort();
+        }
+        for timer in stopped {
             let _ = timer.task.await;
         }
     }

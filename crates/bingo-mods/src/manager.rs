@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock, Weak},
 };
 
+mod acquisition;
 mod directories;
 mod reload;
 mod rescan;
@@ -164,13 +165,16 @@ impl Manager {
         if module.engine.is_none() {
             return;
         }
-        self.callbacks.insert(
+        self.callbacks.insert_resolved(
             module.found.name.clone(),
             Arc::new(crate::dollar::callback::Native {
                 generation: module.generation.clone(),
-                module: Arc::downgrade(&module),
+                module: crate::dollar::callback::Owner::Watching(Arc::downgrade(&module)),
                 manager: self.this.get().cloned().unwrap_or_default(),
             }),
+            Arc::new(acquisition::Resolver(
+                self.this.get().cloned().unwrap_or_default(),
+            )),
         );
     }
     pub(crate) fn has_generation(&self, id: &ItemId) -> bool {
@@ -268,7 +272,12 @@ impl PluginSource for Manager {
         "bingo.mods"
     }
     async fn reload(&self) -> Result<PluginReload, KernelError> {
-        self.rescan(true).await
+        let manager = self
+            .this
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| reload::failed("module manager is unavailable"))?;
+        acquisition::run(self, async move { manager.rescan(true).await }).await?
     }
     async fn plugins(&self) -> Vec<PluginStatus> {
         let retired = self.switches.retired.lock().await;
@@ -414,3 +423,7 @@ impl CommandSource for Manager {
         commands
     }
 }
+
+#[cfg(test)]
+#[path = "manager/acquisition/tests.rs"]
+mod acquisition_tests;
