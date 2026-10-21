@@ -275,29 +275,6 @@ impl Host {
         }
     }
 
-    pub(crate) fn until_within(&mut self, kind: &str, limit: Duration, failure: &str) -> Value {
-        wait_within(limit, async {
-            loop {
-                match self.said.try_recv() {
-                    Ok(line) => {
-                        let value = parsed(&line);
-                        self.lines.push(value.clone());
-                        if value["type"] == kind {
-                            return value;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        panic!("stdout ended before a {kind} line")
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        tokio::time::sleep(Duration::from_millis(20)).await
-                    }
-                }
-            }
-        })
-        .unwrap_or_else(|_| panic!("{failure}"))
-    }
-
     fn answer(&mut self, request: &Value, verdict: Value) {
         self.send(&json!({
             "type": "control_response",

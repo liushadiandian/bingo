@@ -296,51 +296,108 @@ fn growing(home: &std::path::Path) -> bool {
 
 /// A person's `ctrl+b` is this command with the running call's id; the TUI
 /// fires it as an action and a host types it, and both are the one door.
+/// The test releases the second line only after the promoted call returns,
+/// and kills the job only after that line reaches its log.
 const PROMOTED: &str = r#"{"responses":[
-    {"steps":[{"toolCall":{"name":"Bash","input":{"command":"echo before; sleep 30"}}}]},
-    {"steps":[{"toolCall":{"name":"KillShell","input":{"id":"job_"}}}]},
+    {"steps":[{"toolCall":{"name":"Bash","input":{
+        "command":"echo before; while [ ! -f go ]; do sleep 0.05; done; echo after; while [ ! -f stop ]; do sleep 0.05; done"}}}]},
     {"steps":[{"text":"it is in the background now"}]},
+    {"steps":[{"toolCall":{"name":"KillShell","input":{"id":"job_"}}}]},
+    {"steps":[{"text":"stopped it"}]},
     {"steps":[{"text":"and I heard it end"}]}
 ]}"#;
+
+/// Native frames expose the running call's tail; the compatibility envelope
+/// announces a pending call but has no progress event to wait for.
+fn promotion_host(dir: &std::path::Path, script: &tempfile::NamedTempFile) -> Host {
+    Host::start(
+        bingo()
+            .env("BINGO_FAKE_SCRIPT", script.path())
+            .envs(home_env(dir))
+            .args([
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "json",
+                "--dangerously-skip-permissions",
+                "--cwd",
+            ])
+            .arg(dir),
+    )
+}
+
+fn buffered_bash_call(host: &mut Host) -> String {
+    let asked = loop {
+        let frame = host.until_event("itemStarted");
+        if frame["event"]["item"]["body"]["kind"] == "toolCall" {
+            break frame["event"]["item"].clone();
+        }
+    };
+    assert_eq!(asked["body"]["name"], "Bash", "{asked}");
+    // A tail proves both that the promotion listener is registered and that
+    // the pipe has reached the foreground buffer, not merely that a shell
+    // was spawned. The tool-use announcement proves neither.
+    let tail = host.until_event("itemDelta");
+    assert_eq!(tail["event"]["item"], asked["id"], "{tail}");
+    assert_eq!(tail["event"]["kind"], "tail", "{tail}");
+    assert_eq!(tail["event"]["data"], "before", "{tail}");
+    asked["body"]["callId"].as_str().unwrap().to_string()
+}
+
+fn framed_tool_result(lines: &[Value], name: &str) -> String {
+    let body = lines
+        .iter()
+        .find(|line| {
+            line["event"]["type"] == "itemCompleted"
+                && line["event"]["item"]["body"]["name"] == name
+        })
+        .map(|line| &line["event"]["item"]["body"])
+        .unwrap_or_else(|| panic!("no completed {name} call: {lines:#?}"));
+    let output: bingo_sdk::ToolOutput = serde_json::from_value(body["output"].clone()).unwrap();
+    assert!(!output.is_error, "{name}: {output:?}");
+    output
+        .parts
+        .iter()
+        .filter_map(bingo_sdk::ContentPart::as_text)
+        .collect()
+}
 
 #[test]
 fn a_running_command_is_promoted_mid_turn_and_the_call_returns_early() {
     let dir = tempfile::tempdir().unwrap();
     let script = script(PROMOTED);
-    let mut host = Host::start(&mut allowed(dir.path(), &script));
+    let mut host = promotion_host(dir.path(), &script);
 
     host.prompt("run the slow thing");
-    // The call is announced as the assistant asking for it, which is how a
-    // surface knows which call `ctrl+b` is about.
-    let asked = host.until("assistant");
-    assert_eq!(asked["message"]["content"][0]["name"], "Bash");
-    let call = asked["message"]["content"][0]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the call id: {asked}"))
-        .to_string();
-
+    let call = buffered_bash_call(&mut host);
     host.prompt(&format!("/bash.promote {call}"));
-    let result = host.until_within(
-        "result",
-        Duration::from_secs(25),
-        "the call waited for the command anyway",
+    let result = host.until_event("turnCompleted");
+    assert_eq!(result["event"]["status"]["kind"], "completed", "{result}");
+    // The command cannot finish while its gate is closed. A completed turn
+    // here proves early return without racing two wall-clock deadlines.
+    assert_eq!(
+        log_text(dir.path()),
+        "before\n",
+        "the buffer did not follow"
     );
-    assert_eq!(result["result"], "it is in the background now");
+
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    until("the same command wrote after promotion", || {
+        log_of(dir.path()).filter(|log| log == "before\nafter\n")
+    });
+    host.prompt("stop it now");
+    host.until_event("turnCompleted");
     let ended = host.finish();
     assert_eq!(ended.code, Some(0), "stderr: {}", ended.err);
 
-    let promoted = tool_result(&ended.lines, "Bash");
+    let promoted = framed_tool_result(&ended.lines, "Bash");
     assert!(promoted.contains("moved into the background"), "{promoted}");
     assert!(promoted.contains("job_"), "no job id: {promoted}");
     assert!(promoted.contains("no timeout"), "{promoted}");
-
-    // The same process carried on: what it wrote before the promotion is at
-    // the head of the log it writes now.
-    let log = log_text(dir.path());
-    assert!(
-        log.starts_with("before"),
-        "the buffer did not follow: {log}"
-    );
+    let killed = framed_tool_result(&ended.lines, "KillShell");
+    assert!(killed.contains("killed"), "{killed}");
+    assert_eq!(log_text(dir.path()), "before\nafter\n");
 }
 
 /// Every byte journaled under a run's data dir. A wake's own text is what the
