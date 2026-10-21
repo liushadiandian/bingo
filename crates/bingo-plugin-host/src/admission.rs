@@ -13,13 +13,17 @@ enum State {
     Stopped(PluginState),
 }
 #[derive(Default)]
-pub struct Admission(Mutex<State>);
+pub struct Admission {
+    state: Mutex<State>,
+    changed: tokio::sync::Notify,
+}
 impl Admission {
     pub fn stop(&self, state: PluginState) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = State::Stopped(state);
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::Stopped(state);
+        self.changed.notify_waiters();
     }
     pub fn state(&self) -> PluginState {
-        match &*self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
             State::Pending | State::Checking(_) => PluginState::Registering,
             State::Allowed(_) => PluginState::On,
             State::Refused(_, why) => PluginState::Failed { why: why.clone() },
@@ -50,7 +54,7 @@ impl Admission {
         &self,
         registration: PluginRegistration,
     ) -> Option<PluginRegistration> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(*state, State::Pending) {
             return None;
         }
@@ -58,17 +62,37 @@ impl Admission {
         Some(registration)
     }
     pub fn reset(&self) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = State::Pending;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::Pending;
+        self.changed.notify_waiters();
     }
     pub fn decision(&self) -> Result<Option<PluginGrant>, String> {
-        match &*self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        Self::answer(&self.state.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    fn answer(state: &State) -> Result<Option<PluginGrant>, String> {
+        match state {
             State::Pending | State::Checking(_) | State::Stopped(_) => Ok(None),
             State::Allowed(grant) => Ok(Some(grant.clone())),
             State::Refused(_, reason) => Err(reason.clone()),
         }
     }
+    /// Wait for another task's registration, but not an unclaimed admission.
+    pub async fn settled(&self) -> Result<Option<PluginGrant>, String> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let ready = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                (!matches!(*state, State::Checking(_))).then(|| Self::answer(&state))
+            };
+            if let Some(decision) = ready {
+                return decision;
+            }
+            changed.await;
+        }
+    }
     pub fn finish(&self, result: Result<PluginGrant, String>) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let previous = match &*state {
             State::Checking(grant) | State::Allowed(grant) => Some(grant.clone()),
             State::Refused(grant, _) => grant.clone(),
@@ -78,10 +102,11 @@ impl Admission {
             Ok(grant) => State::Allowed(grant),
             Err(reason) => State::Refused(previous, reason),
         };
+        self.changed.notify_waiters();
     }
     pub fn allowed(&self) -> bool {
         matches!(
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()),
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()),
             State::Allowed(_)
         )
     }
@@ -104,3 +129,6 @@ impl Admission {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -60,6 +60,15 @@ impl Store {
         }
     }
 
+    /// Share serialized file access, but start fresh render subscriptions.
+    pub fn fork(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            lock: self.lock.clone(),
+            subscribed: Arc::default(),
+        }
+    }
+
     pub async fn subscribe(
         &self,
         host: &bingo_sdk::HostHandle,
@@ -231,6 +240,23 @@ fn failed(error: impl std::fmt::Display) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_views_share_storage_even_after_a_writer_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let owner = Store::new(root.path(), "fixture");
+        let old = owner.fork();
+        let write = old.lock.clone().try_lock_owned().unwrap();
+        drop(old);
+        let replacement = owner.fork();
+        assert!(Arc::ptr_eq(&owner.lock, &replacement.lock));
+        assert!(replacement.lock.try_lock().is_err());
+        assert!(!Arc::ptr_eq(&owner.subscribed, &replacement.subscribed));
+        let caller = replacement.clone();
+        assert!(Arc::ptr_eq(&caller.subscribed, &replacement.subscribed));
+        drop(write);
+        assert!(replacement.lock.try_lock().is_ok());
+    }
+
     #[test]
     fn compare_and_swap_only_accepts_the_held_version() {
         assert_eq!(swap(None, None), Ok(1));

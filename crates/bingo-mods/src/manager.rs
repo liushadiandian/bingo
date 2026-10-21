@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bingo_plugin_host::{
     discovery,
     notice::{self, Notice, Notices},
+    state::Store,
 };
 use bingo_sdk::*;
 use serde_json::Value;
@@ -13,6 +14,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock, Weak},
 };
 
+mod acquisition;
 mod directories;
 mod reload;
 mod rescan;
@@ -112,7 +114,8 @@ impl Manager {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&found.name);
-            let module = Module::load(found, config, self.limits.clone(), &self.env, off).await;
+            let store = self.store(&found.name);
+            let module = Module::load(found, config, self.limits.clone(), store, off).await;
             if !off && let Err(reason) = module.admission.decision() {
                 self.notices.push(Notice::warn("PLUGIN_UNREADABLE", reason));
             }
@@ -154,6 +157,17 @@ impl Manager {
         )
         .await
     }
+    fn store(&self, name: &str) -> Store {
+        // Generations overlap, and cancelled calls may still have a blocking
+        // write in flight. Keep one serializer per plugin across every generation.
+        self.switches
+            .stores
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(name.into())
+            .or_insert_with(|| Store::new(&self.env.data_dir, name))
+            .fork()
+    }
     pub(crate) fn env(&self) -> &Env {
         &self.env
     }
@@ -164,13 +178,16 @@ impl Manager {
         if module.engine.is_none() {
             return;
         }
-        self.callbacks.insert(
+        self.callbacks.insert_resolved(
             module.found.name.clone(),
             Arc::new(crate::dollar::callback::Native {
                 generation: module.generation.clone(),
-                module: Arc::downgrade(&module),
+                module: crate::dollar::callback::Owner::Watching(Arc::downgrade(&module)),
                 manager: self.this.get().cloned().unwrap_or_default(),
             }),
+            Arc::new(acquisition::Resolver(
+                self.this.get().cloned().unwrap_or_default(),
+            )),
         );
     }
     pub(crate) fn has_generation(&self, id: &ItemId) -> bool {
@@ -268,7 +285,12 @@ impl PluginSource for Manager {
         "bingo.mods"
     }
     async fn reload(&self) -> Result<PluginReload, KernelError> {
-        self.rescan(true).await
+        let manager = self
+            .this
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| reload::failed("module manager is unavailable"))?;
+        acquisition::run(self, async move { manager.rescan(true).await }).await?
     }
     async fn plugins(&self) -> Vec<PluginStatus> {
         let retired = self.switches.retired.lock().await;
@@ -338,7 +360,6 @@ impl PluginSource for Manager {
                 && matches!(module.admission.state(), PluginState::Registering)
         }) {
             let denied = result.is_err();
-            module.admission.finish(result);
             if let Some(testing) = self.dollar.get().and_then(|dollar| dollar.testing.as_ref()) {
                 let observes = !denied
                     && crate::link::Link(module.clone())
@@ -348,6 +369,7 @@ impl PluginSource for Manager {
                     let _ = module.started.set(started);
                 }
             }
+            module.admission.finish(result);
             if denied {
                 module.close().await;
             }
@@ -414,3 +436,7 @@ impl CommandSource for Manager {
         commands
     }
 }
+
+#[cfg(test)]
+#[path = "manager/acquisition/tests.rs"]
+mod acquisition_tests;

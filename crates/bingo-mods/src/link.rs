@@ -203,7 +203,7 @@ mod tests {
             found,
             Value::Null,
             crate::engine::Limits::default(),
-            &Env::rooted(home.path()),
+            bingo_plugin_host::state::Store::new(&Env::rooted(home.path()).data_dir, "fixture"),
             true,
         )
         .await;

@@ -93,6 +93,9 @@ impl Runtime {
         &self.processes
     }
 
+    pub(crate) async fn retire(&self, generation: &ItemId) {
+        self.timers.retire(generation).await;
+    }
     pub async fn reload(&self, plugin: &str, generation: &ItemId) {
         self.processes
             .remove(Some(plugin), Some(generation), None)

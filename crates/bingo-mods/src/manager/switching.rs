@@ -6,6 +6,8 @@ use bingo_sdk::plugin::PluginSwitch;
 pub(super) struct State {
     pub off: RwLock<BTreeSet<String>>,
     pub retired: tokio::sync::Mutex<Vec<Arc<Module>>>,
+    // Storage outlives every generation, including removals and disabled modules.
+    pub stores: Mutex<BTreeMap<String, Store>>,
     pub requests: Mutex<BTreeMap<String, Arc<Request>>>,
     pub changed: tokio::sync::Notify,
 }
@@ -141,14 +143,8 @@ pub(super) async fn switch_module(
         .get(&old.found.name)
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let module = Module::load(
-        found,
-        config,
-        manager.limits.clone(),
-        &manager.env,
-        !enabled,
-    )
-    .await;
+    let store = manager.store(&found.name);
+    let module = Module::load(found, config, manager.limits.clone(), store, !enabled).await;
     // A previously unloaded module has no hook metadata until register has run.
     let kind = classify(manager, &module);
     if enabled && kind != PluginSwitch::Now {
@@ -207,10 +203,13 @@ async fn activate_switch(
     if owned && let Some(dollar) = manager.dollar.get() {
         dollar.unregister(name);
     }
-    manager.replace(&old, module.clone());
-    wish(manager, name, enabled);
-    if owned {
-        manager.switches.retired.lock().await.push(old);
+    {
+        let mut retired = manager.switches.retired.lock().await;
+        manager.replace(&old, module.clone());
+        wish(manager, name, enabled);
+        if owned {
+            retired.push(old);
+        }
     }
     manager.publish_callbacks(module.clone());
     let host = manager
@@ -218,7 +217,7 @@ async fn activate_switch(
         .get()
         .ok_or_else(|| reload::failed("module host unavailable"))?;
     host.catalog(CatalogKind::Plugins).await?;
-    module.admission.decision().map_err(reload::failed)?;
+    manager.registration_settled(&module).await?;
     manager.restart_sessions(&module, host).await?;
     manager.baseline(false);
     Ok(())
@@ -254,6 +253,9 @@ async fn wait_retired(manager: &Manager, id: &str, name: &str, request: &Arc<Req
 }
 pub(super) async fn reap(manager: &Manager) {
     let _guard = manager.reloading.lock().await;
+    reap_locked(manager).await;
+}
+pub(super) async fn reap_locked(manager: &Manager) {
     let ready: Vec<_> = manager
         .switches
         .retired
@@ -261,21 +263,28 @@ pub(super) async fn reap(manager: &Manager) {
         .await
         .iter()
         .filter(|module| Arc::strong_count(module) == 1)
-        .cloned()
+        .map(|module| {
+            // Retired acquisition checks this token under the same list lock.
+            // Leave cleanup ownership in the list if this future is cancelled.
+            if let Some(engine) = &module.engine {
+                engine.stopped().cancel();
+            }
+            module.clone()
+        })
         .collect();
     for module in ready {
         module.close().await;
-        // Release only this generation after its last running reference ends.
+        cleanup(manager, &module).await;
         manager
             .switches
             .retired
             .lock()
             .await
             .retain(|entry| !Arc::ptr_eq(entry, &module));
-        cleanup(manager, &module).await;
         manager.switches.changed.notify_waiters();
     }
 }
+
 pub(super) async fn cleanup(manager: &Manager, module: &Module) {
     manager
         .callbacks

@@ -5,6 +5,7 @@ use bingo_plugin_host::{discovery::Found, stamps::stamps};
 impl Manager {
     pub(super) async fn rescan(&self, project: bool) -> Result<PluginReload, KernelError> {
         let _guard = self.reloading.lock().await;
+        switching::running(self)?;
         let old = self.modules();
         let (found, mut report) = self.discovered(project, &old);
         for module in &old {
@@ -45,6 +46,8 @@ impl Manager {
                 }
             }
         }
+        drop(old);
+        switching::reap_locked(self).await;
         self.baseline(project);
         self.report_changes(&report);
         self.catalogues_changed();
@@ -104,12 +107,18 @@ impl Manager {
             .is_none_or(|watch| watch.before != after)
     }
     async fn remove_module(&self, module: &Arc<Module>) {
-        module.close().await;
-        switching::cleanup(self, module).await;
-        self.modules
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|entry| !Arc::ptr_eq(entry, module));
+        {
+            let mut retired = self.switches.retired.lock().await;
+            self.modules
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|entry| !Arc::ptr_eq(entry, module));
+            retired.push(module.clone());
+        }
+        if let Some(dollar) = self.dollar.get() {
+            dollar.retire(&module.generation).await;
+        }
+        self.clear_signals(module).await;
     }
     pub(super) async fn clear_signals(&self, module: &Module) {
         if let Some(host) = self.host.get() {
@@ -167,14 +176,6 @@ impl Manager {
         found: Found,
         old: Option<&Arc<Module>>,
     ) -> Result<(), KernelError> {
-        if let Some(old) = old {
-            old.close().await;
-            self.callbacks
-                .remove_generation(&old.found.name, &old.generation);
-            if let Some(dollar) = self.dollar.get() {
-                dollar.reload(&old.found.name, &old.generation).await;
-            }
-        }
         let config = self
             .settings
             .get(&found.name)
@@ -186,14 +187,22 @@ impl Manager {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&found.name);
-        let module = Module::load(found, config, self.limits.clone(), &self.env, off).await;
+        let store = self.store(&found.name);
+        let module = Module::load(found, config, self.limits.clone(), store, off).await;
         if let Some(old) = old {
+            let mut retired = self.switches.retired.lock().await;
             self.replace(old, module.clone());
+            retired.push(old.clone());
         } else {
             self.modules
                 .write()
                 .unwrap_or_else(|error| error.into_inner())
                 .push(module.clone());
+        }
+        if let Some(old) = old
+            && let Some(dollar) = self.dollar.get()
+        {
+            dollar.retire(&old.generation).await;
         }
         self.publish_callbacks(module.clone());
         let host = self
@@ -201,10 +210,11 @@ impl Manager {
             .get()
             .ok_or_else(|| reload::failed("module host is unavailable"))?;
         host.catalog(CatalogKind::Plugins).await?;
+        let admission = self.registration_settled(&module).await;
         if let Some(old) = old {
             self.handoff_signals(host, old, &module).await?;
         }
-        module.admission.decision().map_err(reload::failed)?;
+        admission?;
         self.restart_sessions(&module, host).await?;
         Ok(())
     }
