@@ -56,6 +56,34 @@ impl Fixture {
             root,
         }
     }
+    fn hold_registration(&self) -> tokio::sync::mpsc::UnboundedReceiver<Arc<Module>> {
+        let (claimed, claims) = tokio::sync::mpsc::unbounded_channel();
+        self.host.on_catalog({
+            let manager = Arc::downgrade(&self.manager);
+            move |kind| {
+                let manager = manager.upgrade().unwrap();
+                let claimed = claimed.clone();
+                async move {
+                    for module in manager.modules() {
+                        if module
+                            .admission
+                            .claim(&module.found, PluginRuntime::Module, None)
+                            .is_some()
+                        {
+                            // A concurrent catalogue owns this registration. This
+                            // read must not mistake its pending claim for admission.
+                            claimed.send(module).unwrap();
+                        }
+                    }
+                    Ok(Catalog {
+                        kind,
+                        entries: vec![],
+                    })
+                }
+            }
+        });
+        claims
+    }
     fn edit(&self) {
         std::fs::write(
             self.root.join("main.ts"),
@@ -244,6 +272,69 @@ async fn cancelling_a_reload_waiter_does_not_abandon_publication() {
             );
             assert!(!acquired.stopped().is_cancelled());
         }
+        fixture.manager.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn reload_waits_for_another_tasks_registration_of_the_replacement() {
+    let fixture = Fixture::new().await;
+    let _old = fixture.manager.modules()[0].clone();
+    let mut claims = fixture.hold_registration();
+    fixture.edit();
+    let mut reload = Box::pin(fixture.manager.rescan(true));
+    let replacement = tokio::select! {
+        biased;
+        result = &mut reload => panic!("reload returned before admission: {result:?}"),
+        module = claims.recv() => module.unwrap(),
+    };
+    assert!(futures::poll!(&mut reload).is_pending());
+    assert!(!replacement.admission.allowed());
+    fixture
+        .manager
+        .registered(
+            "fixture",
+            Ok(PluginGrant {
+                tier: Tier::Rewrite,
+                uses: Default::default(),
+            }),
+        )
+        .await;
+    reload.await.unwrap();
+    assert!(replacement.admission.allowed());
+    fixture.manager.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_registration_cannot_hold_reload_or_shutdown_forever() {
+    for stop in [false, true] {
+        let fixture = Fixture::new().await;
+        let _old = fixture.manager.modules()[0].clone();
+        let mut claims = fixture.hold_registration();
+        fixture.edit();
+        let mut reload = Box::pin(fixture.manager.rescan(true));
+        let _replacement = tokio::select! {
+            biased;
+            result = &mut reload => panic!("reload returned before admission: {result:?}"),
+            module = claims.recv() => module.unwrap(),
+        };
+        assert!(futures::poll!(&mut reload).is_pending());
+        if stop {
+            fixture.manager.stop.cancel();
+        } else {
+            tokio::time::advance(HOOK_DEADLINE).await;
+        }
+        let report = reload.await.unwrap();
+        let expected = if stop {
+            "module manager stopped"
+        } else {
+            "registration deadline exceeded"
+        };
+        assert!(
+            report.errors.iter().any(|error| error.contains(expected)),
+            "{report:?}"
+        );
+        assert!(fixture.manager.reloading.try_lock().is_ok());
         fixture.manager.stop().await;
     }
 }

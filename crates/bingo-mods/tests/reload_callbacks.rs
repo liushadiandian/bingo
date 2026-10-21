@@ -493,3 +493,139 @@ async fn reload_cancels_old_timers_without_cancelling_acquired_commands() {
     applied(fixture.command("/ledger").await, "new");
     fixture.host.shutdown().await;
 }
+
+const STARTUP: &str = r#"export function register(on) {
+  on('session.start', async $ => {
+    for (let i = 0; i < 64; i++) await $.state.set('first', i);
+    await $.command.register({name:'ready',hint:'Ready',aliases:[],args:{kind:'none'},instant:true},
+      async () => ({kind:'applied'}));
+  });
+  on('session.*', async $ => {
+    for (let i = 0; i < 64; i++) await $.state.set('last', i);
+    await $.state.set('ready', true);
+  });
+}"#;
+
+struct Startup {
+    _home: tempfile::TempDir,
+    root: PathBuf,
+    environment: Arc<bingo_mods::testing::Environment>,
+    modules: ModsPlugin,
+    host: Arc<Host>,
+    attachment: Attachment,
+}
+impl Startup {
+    async fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("startup");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            r#"{"name":"startup","version":"1","module":"main.ts","uses":["state","command"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("main.ts"), STARTUP).unwrap();
+        let environment = Arc::new(bingo_mods::testing::Environment::default());
+        let modules = ModsPlugin::default()
+            .with_dirs(vec![root.clone()])
+            .with_project(home.path().into())
+            .with_testing(environment.clone());
+        let host = Host::build(
+            vec![Box::new(modules.clone())],
+            HostConfig::new(Env::rooted(home.path())),
+        )
+        .await
+        .unwrap();
+        let attachment = open(&host, home.path(), Driver::Log).await;
+        finish(environment.wait_for_start(&attachment.session))
+            .await
+            .unwrap();
+        Self {
+            _home: home,
+            root,
+            environment,
+            modules,
+            host,
+            attachment,
+        }
+    }
+    async fn call(&self, method: &str, input: Value) -> Value {
+        self.modules
+            .testing_call("startup", method, input)
+            .await
+            .unwrap()
+    }
+    async fn ready(&mut self) {
+        let intent: IntentId = serde_json::from_value(
+            self.call(
+                "host/command/run",
+                json!({"session":self.attachment.session,"name":"ready","args":{}}),
+            )
+            .await,
+        )
+        .unwrap();
+        let mut notices = Vec::new();
+        let outcome = finish(async {
+            while let Some(frame) = self.attachment.events.next().await {
+                match &frame.event {
+                    Event::Notice { text, .. } => notices.push(text.clone()),
+                    Event::ItemCompleted { item } => {
+                        if let ItemBody::Notice { text, .. } = &item.body {
+                            notices.push(text.clone());
+                        }
+                    }
+                    _ => (),
+                }
+                if let Event::IntentAck {
+                    intent: seen,
+                    outcome,
+                } = frame.event
+                    && seen == intent
+                {
+                    return outcome;
+                }
+            }
+            panic!("startup command acknowledgement stream ended");
+        })
+        .await;
+        assert!(
+            matches!(outcome, IntentOutcome::Applied { .. }),
+            "{outcome:?}; notices: {notices:?}"
+        );
+        let state = self
+            .call(
+                "host/state/get",
+                json!({"scope":self.attachment.session,"key":"ready"}),
+            )
+            .await;
+        assert_eq!(state["value"], true);
+    }
+}
+
+#[tokio::test]
+async fn testing_reload_waits_for_startup_command_registration() {
+    let mut startup = Startup::new().await;
+    for _ in 0..2 {
+        startup
+            .call(
+                "host/state/set",
+                json!({"scope":startup.attachment.session,"key":"ready","value":false}),
+            )
+            .await;
+        startup.modules.reload(&startup.root).await.unwrap();
+        finish(
+            startup
+                .environment
+                .wait_for_start(&startup.attachment.session),
+        )
+        .await
+        .unwrap();
+        startup
+            .host
+            .session_state(&startup.attachment.session)
+            .await
+            .unwrap();
+        startup.ready().await;
+    }
+    startup.host.shutdown().await;
+}

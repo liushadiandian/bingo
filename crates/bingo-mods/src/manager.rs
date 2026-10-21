@@ -347,7 +347,6 @@ impl PluginSource for Manager {
                 && matches!(module.admission.state(), PluginState::Registering)
         }) {
             let denied = result.is_err();
-            module.admission.finish(result);
             if let Some(testing) = self.dollar.get().and_then(|dollar| dollar.testing.as_ref()) {
                 let observes = !denied
                     && crate::link::Link(module.clone())
@@ -357,6 +356,7 @@ impl PluginSource for Manager {
                     let _ = module.started.set(started);
                 }
             }
+            module.admission.finish(result);
             if denied {
                 module.close().await;
             }

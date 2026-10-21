@@ -209,10 +209,11 @@ impl Manager {
             .get()
             .ok_or_else(|| reload::failed("module host is unavailable"))?;
         host.catalog(CatalogKind::Plugins).await?;
+        let admission = self.registration_settled(&module).await;
         if let Some(old) = old {
             self.handoff_signals(host, old, &module).await?;
         }
-        module.admission.decision().map_err(reload::failed)?;
+        admission?;
         self.restart_sessions(&module, host).await?;
         Ok(())
     }

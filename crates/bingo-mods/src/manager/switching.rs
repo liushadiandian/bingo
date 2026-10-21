@@ -221,7 +221,7 @@ async fn activate_switch(
         .get()
         .ok_or_else(|| reload::failed("module host unavailable"))?;
     host.catalog(CatalogKind::Plugins).await?;
-    module.admission.decision().map_err(reload::failed)?;
+    manager.registration_settled(&module).await?;
     manager.restart_sessions(&module, host).await?;
     manager.baseline(false);
     Ok(())

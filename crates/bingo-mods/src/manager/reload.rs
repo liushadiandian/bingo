@@ -189,6 +189,19 @@ impl Manager {
             *slot = module;
         }
     }
+    pub(super) async fn registration_settled(&self, module: &Module) -> Result<(), KernelError> {
+        // An unrelated catalogue may own the claim. A cancelled claimant must
+        // fail this reload, not hold every subsequent reload indefinitely.
+        tokio::select! {
+            biased;
+            _ = self.stop.cancelled() => return Err(failed("module manager stopped")),
+            result = tokio::time::timeout(HOOK_DEADLINE, module.admission.settled()) => {
+                result.map_err(|_| failed(format!("{}: plugin registration deadline exceeded", module.found.name)))?
+                    .map_err(failed)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) async fn restart_sessions(
         &self,
         module: &Arc<Module>,
