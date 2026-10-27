@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, dev]
+    branches: ['validation/**']
   pull_request:
 concurrency:
   group: ci-${{ github.ref }}
@@ -80,6 +80,20 @@ jobs:
       # No developer runs these, so a run names every failure, not only the
       # first failing binary's.
       - run: cargo test --workspace --locked --no-fail-fast -- --test-threads=2
+      - name: Native image-paste companion contracts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path (Get-Location) 'scripts'
+          $f = [Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
+          $refs = @('System.dll', ($f+'WPF/UIAutomationClient.dll'), ($f+'WPF/UIAutomationTypes.dll'), ($f+'WPF/WindowsBase.dll'))
+          Add-Type -TypeDefinition ([IO.File]::ReadAllText("$dir/windows-image-paste.cs") + [IO.File]::ReadAllText("$dir/windows-image-paste.tests.cs")) -ReferencedAssemblies $refs
+          [Bingo.ImagePaste.ContractTests]::Policy()
+          [Bingo.ImagePaste.ContractTests]::NativeConsole()
+          [Bingo.ImagePaste.ContractTests]::Lifecycle("$dir/windows-image-paste.cs")
+          $exe = Get-ChildItem 'target/debug/deps/bingo_surface_tui-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'TUI test executable missing' }
+          [Bingo.ImagePaste.ContractTests]::Crossterm($exe.FullName, 'terminal::image_paste::tests::crossterm_ctrl_v_fixture')
   deny:
     timeout-minutes: 15
     runs-on: ubuntu-latest
